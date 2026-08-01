@@ -249,6 +249,13 @@ static void OpenLogFile()
 		// Header only written once conceptually, but harmless if repeated across appended
 		// sessions -- makes each session's data easy to spot when eyeballing the file.
 		fprintf(s_logFile, "# ---- MQ2PacketLogger session start ----\n");
+		// Column legend: a..h are positionally-reused per log_type (see the UNIFIED
+		// SINGLE-FILE LOG comment near the top of this file for full rationale).
+		fprintf(s_logFile, "# opcode:   a=direction(in/out)  b=opcode_hex  c=opcode_dec\n");
+		fprintf(s_logFile, "# context:  a=game_state  b=zone_short  c=player_x  d=player_y  e=player_z  f=player_heading  detail=stand_state,in_combat,casting_spell_id,target_id,target_type,target_name,target_distance\n");
+		fprintf(s_logFile, "# action:   a=event_type  detail=free-form description of the event\n");
+		fprintf(s_logFile, "# spawn:    a=event(spawn/despawn)  b=spawn_id  c=name  d=type  e=level  f=x  g=y  h=z  detail=class_id,race_id,hp_cur,hp_max,master_id,casting_spell_id\n");
+		fprintf(s_logFile, "# snapshot: a=section  b=key  detail=value\n");
 		fprintf(s_logFile, "unix_ms,log_type,a,b,c,d,e,f,g,h,detail\n");
 		fflush(s_logFile);
 	}
