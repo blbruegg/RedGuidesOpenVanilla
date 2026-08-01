@@ -124,6 +124,54 @@
  *   Character "flags/status" beyond class/level/race/AA/anon/PvP is likewise deferred -- most such
  *   flags (achievement/task/keyring-slot flags) live behind their own manager objects and aren't
  *   readily available as a flat readable value.
+ *
+ * UNIFIED SINGLE-FILE LOG (added 2026-08-01, replacing the 5-file layout above):
+ *   User feedback: cross-referencing "what opcode arrived right when I started casting" required
+ *   manually opening two separate CSVs and eyeballing nearest timestamps by hand. All 5 logs above
+ *   share the same unix_ms epoch already, so the fix is to just write them all into ONE
+ *   timestamp-ordered file -- PacketLogger.csv -- instead of 5 separate ones. Sorting/filtering by
+ *   time in Excel or a script then trivially interleaves opcodes with actions/context/spawns/snapshot
+ *   without any manual join.
+ *
+ *   SCHEMA: `unix_ms,log_type,a,b,c,d,e,f,g,h,detail`
+ *     - unix_ms   : shared epoch, same as before.
+ *     - log_type  : one of opcode|context|action|spawn|snapshot -- what shape the rest of the row is.
+ *     - a..h      : 8 generic, positionally-reused columns. Each log_type packs its most
+ *                   structured/uniform fields into these left-to-right (documented per type just
+ *                   below); anything left over, or anything inherently free-form/ragged (the action
+ *                   log's detail string, the snapshot's section/key/value triple), goes in the
+ *                   trailing `detail` column as a `key=value key2=value2` blob. This keeps the common
+ *                   case (opcode/spawn/context rows, which are already columnar) genuinely readable
+ *                   as real spreadsheet columns, while still accommodating the two ragged shapes
+ *                   (action, snapshot) without inventing 20+ mostly-empty columns that only apply to
+ *                   one log_type each. Option (a) from the task brief (one wide fixed schema with
+ *                   many empty columns per row) was considered and rejected: the snapshot log alone
+ *                   has ~5 genuinely different "shapes" (char header fields, AA totals, skills,
+ *                   inventory slots, keyring entries) with no natural columnar alignment between them
+ *                   and the other 4 logs' fields -- forcing all of that into fixed named columns would
+ *                   leave the vast majority of any given row blank AND still need a catch-all for the
+ *                   inventory/skill/keyring key-value pairs. Reusing 8 generic slots + a detail
+ *                   column keeps the file narrow enough to actually read while losing zero data.
+ *
+ *   Per-log_type column packing (empty column = written as blank field, i.e. just a comma):
+ *     opcode   : a=direction(in/out)              b=opcode_hex   c=opcode_dec   detail=(unused)
+ *     context  : a=game_state   b=zone_short   c=player_x   d=player_y   e=player_z   f=player_heading
+ *                detail="stand_state=.. in_combat=.. casting_spell_id=.. target_id=.. target_type=..
+ *                        target_name=.. target_distance=.."
+ *                (position gets real columns since it's the field most worth sorting/plotting on;
+ *                the rest is lower-cardinality/more occasional, so it goes in detail)
+ *     action   : a=event_type                      detail=(the same free-form detail string the
+ *                                                            action log always wrote, unchanged)
+ *     spawn    : a=event(spawn/despawn)  b=spawn_id  c=name  d=type  e=level  f=x  g=y  h=z
+ *                detail="class_id=.. race_id=.. hp_cur=.. hp_max=.. master_id=.. casting_spell_id=.."
+ *     snapshot : a=section  b=key                   detail="value=.." (value can itself contain a
+ *                                                            CSV-escaped quoted sub-value; unchanged
+ *                                                            from the old per-row escaping logic)
+ *
+ *   All 5 call sites now write through one FILE-pointer/mutex pair (s_logFile/s_logMutex) opened once at
+ *   plugin load and closed once at unload, replacing the previous 5 separate FILE* statics and their
+ *   5 Open/Close function pairs. The _fsopen(path, "a", _SH_DENYWR) pattern is preserved exactly --
+ *   see the historical note directly below on why this project uses _fsopen over fopen_s here.
  */
 
 #include <mq/Plugin.h>
@@ -145,104 +193,18 @@ using namespace mq;
 PreSetup("MQ2PacketLogger");
 
 //----------------------------------------------------------------------------
-// Log file
+// Unified log file. All five log "shapes" (opcode/context/action/spawn/snapshot) share one FILE*
+// and one CSV, so the whole session is a single timestamp-sorted stream -- see the UNIFIED
+// SINGLE-FILE LOG note at the top of this file for the schema rationale. One mutex/FILE* pair,
+// one Open/Close pair, replacing the previous five.
 
 static FILE* s_logFile = nullptr;
 static std::mutex s_logMutex;
 
-static void OpenLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_logMutex);
-	if (s_logFile)
-		return;
-
-	// gPathLogs is MQ's standard logs directory (already an absolute path, e.g.
-	// F:\MacroQuest2\Logs) -- same convention other MQ logging plugins/tools use.
-	std::string path = std::string(gPathLogs) + "\\PacketLogger_Opcodes.csv";
-
-	// Append mode: we want a running history across sessions/relogs so opcode coverage
-	// accumulates over multiple play sessions rather than being wiped each time.
-	// _fsopen with _SH_DENYWR (not fopen_s, which defaults to a share mode that blocks
-	// concurrent readers) so the file can be tailed/opened read-only by a text editor or
-	// `tail`-equivalent while the plugin is still writing to it, instead of only becoming
-	// readable after the plugin unloads and closes its handle.
-	s_logFile = _fsopen(path.c_str(), "a", _SH_DENYWR);
-
-	if (s_logFile)
-	{
-		// Header only written once conceptually, but harmless if repeated across appended
-		// sessions -- makes each session's data easy to spot when eyeballing the file.
-		fprintf(s_logFile, "# ---- MQ2PacketLogger session start ----\n");
-		fprintf(s_logFile, "unix_ms,direction,opcode_hex,opcode_dec\n");
-		fflush(s_logFile);
-	}
-}
-
-static void CloseLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_logMutex);
-	if (s_logFile)
-	{
-		fprintf(s_logFile, "# ---- MQ2PacketLogger session end ----\n");
-		fclose(s_logFile);
-		s_logFile = nullptr;
-	}
-}
-
-//----------------------------------------------------------------------------
-// Context log (game state snapshots, sampled periodically from OnPulse -- see the
-// CONTEXT-CAPTURE DESIGN note at the top of this file for why this is separate from the
-// per-packet opcode log rather than folded into it).
-
-static FILE* s_contextLogFile = nullptr;
-static std::mutex s_contextLogMutex;
-
-// Only ever touched from OnPulse (main thread), so no lock needed for the throttle itself --
+// Only ever touched from OnPulse (main thread), so no lock needed for the throttles themselves --
 // the mutex above only guards the FILE* against ShutdownPlugin() racing a pulse.
 static std::chrono::steady_clock::time_point s_lastContextSample{};
 static constexpr auto kContextSampleInterval = std::chrono::milliseconds(250);
-
-static void OpenContextLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_contextLogMutex);
-	if (s_contextLogFile)
-		return;
-
-	std::string path = std::string(gPathLogs) + "\\PacketLogger_Context.csv";
-	// See OpenLogFile() above for why _fsopen/_SH_DENYWR instead of fopen_s.
-	s_contextLogFile = _fsopen(path.c_str(), "a", _SH_DENYWR);
-
-	if (s_contextLogFile)
-	{
-		fprintf(s_contextLogFile, "# ---- MQ2PacketLogger session start ----\n");
-		fprintf(s_contextLogFile,
-			"unix_ms,game_state,zone_short,player_x,player_y,player_z,player_heading,"
-			"stand_state,in_combat,casting_spell_id,target_id,target_type,target_name,"
-			"target_distance\n");
-		fflush(s_contextLogFile);
-	}
-}
-
-static void CloseContextLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_contextLogMutex);
-	if (s_contextLogFile)
-	{
-		fprintf(s_contextLogFile, "# ---- MQ2PacketLogger session end ----\n");
-		fclose(s_contextLogFile);
-		s_contextLogFile = nullptr;
-	}
-}
-
-//----------------------------------------------------------------------------
-// Action-event log (discrete, edge-triggered player actions -- see the ACTION-EVENT note at the
-// top of this file). Written from OnPulse (main thread) via a tight-interval edge detector: a row
-// is emitted only when a tracked value actually changes, so this is not per-pulse spam. This is
-// the log the user asked for -- the one that lets you say "at unix_ms X I started casting spell
-// 1234" and line that up against the opcode CSV's nearest timestamp.
-
-static FILE* s_actionLogFile = nullptr;
-static std::mutex s_actionLogMutex;
 
 // Edge-detector interval. Deliberately much tighter than the 250ms context sampler so short
 // actions (a fast cast, a quick sit/stand) aren't missed, but still throttled off raw pulse
@@ -264,110 +226,42 @@ static bool  s_wasAirborne        = false;    // for jump edge detection
 // (main thread), so no lock needed.
 static std::unordered_map<unsigned int, int> s_spawnCastState;
 
-static void OpenActionLogFile()
+static void OpenLogFile()
 {
-	std::lock_guard<std::mutex> lock(s_actionLogMutex);
-	if (s_actionLogFile)
+	std::lock_guard<std::mutex> lock(s_logMutex);
+	if (s_logFile)
 		return;
 
-	std::string path = std::string(gPathLogs) + "\\PacketLogger_Actions.csv";
-	// Same _fsopen/_SH_DENYWR tailable pattern as the other two logs (see OpenLogFile()).
-	s_actionLogFile = _fsopen(path.c_str(), "a", _SH_DENYWR);
+	// gPathLogs is MQ's standard logs directory (already an absolute path, e.g.
+	// F:\MacroQuest2\Logs) -- same convention other MQ logging plugins/tools use.
+	std::string path = std::string(gPathLogs) + "\\PacketLogger.csv";
 
-	if (s_actionLogFile)
+	// Append mode: we want a running history across sessions/relogs so opcode coverage
+	// accumulates over multiple play sessions rather than being wiped each time.
+	// _fsopen with _SH_DENYWR (not fopen_s, which defaults to a share mode that blocks
+	// concurrent readers) so the file can be tailed/opened read-only by a text editor or
+	// `tail`-equivalent while the plugin is still writing to it, instead of only becoming
+	// readable after the plugin unloads and closes its handle.
+	s_logFile = _fsopen(path.c_str(), "a", _SH_DENYWR);
+
+	if (s_logFile)
 	{
-		fprintf(s_actionLogFile, "# ---- MQ2PacketLogger session start ----\n");
-		fprintf(s_actionLogFile, "unix_ms,event_type,detail\n");
-		fflush(s_actionLogFile);
+		// Header only written once conceptually, but harmless if repeated across appended
+		// sessions -- makes each session's data easy to spot when eyeballing the file.
+		fprintf(s_logFile, "# ---- MQ2PacketLogger session start ----\n");
+		fprintf(s_logFile, "unix_ms,log_type,a,b,c,d,e,f,g,h,detail\n");
+		fflush(s_logFile);
 	}
 }
 
-static void CloseActionLogFile()
+static void CloseLogFile()
 {
-	std::lock_guard<std::mutex> lock(s_actionLogMutex);
-	if (s_actionLogFile)
+	std::lock_guard<std::mutex> lock(s_logMutex);
+	if (s_logFile)
 	{
-		fprintf(s_actionLogFile, "# ---- MQ2PacketLogger session end ----\n");
-		fclose(s_actionLogFile);
-		s_actionLogFile = nullptr;
-	}
-}
-
-static long long NowUnixMs()
-{
-	auto now = std::chrono::system_clock::now();
-	return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-}
-
-// Writes one action-event row. detail is already-formatted free text (no commas, or CSV-escaped by
-// the caller). Shares the same unix_ms epoch as the opcode/context logs for nearest-timestamp joins.
-static void LogAction(const char* eventType, const std::string& detail)
-{
-	std::lock_guard<std::mutex> lock(s_actionLogMutex);
-	if (!s_actionLogFile)
-		return;
-
-	fprintf(s_actionLogFile, "%lld,%s,%s\n", NowUnixMs(), eventType, detail.c_str());
-	fflush(s_actionLogFile);
-}
-
-//----------------------------------------------------------------------------
-// Spawn-event log (NPC/PC spawn + despawn events -- added 2026-07-31 in response to user feedback
-// that the logger captured "no npc data other than mob names"). Written from OnAddSpawn/
-// OnRemoveSpawn, which hand us a fully-populated PlayerClient* -- the same spawn/actor struct
-// family used for character data. One row per spawn appear/disappear.
-//
-// WHAT IS AND ISN'T CLIENT-SIDE-OBSERVABLE FOR NPCs (documented honestly, per the user's actual
-// question "what abilities/skills/spells does an NPC have"):
-//   - READILY AVAILABLE on the spawn struct at spawn time and captured below: name, spawn id,
-//     level, class, race, PC-vs-NPC type, current/max HP (for NPCs the client usually only knows
-//     HP as a percentage until you target/engage -- logged as-is, treat as approximate), pet
-//     master id (0 if not a pet), and current CastingData.SpellID.
-//   - NOT AVAILABLE CLIENT-SIDE: an NPC's actual castable-spell list, skill set, or ability roster.
-//     Confirmed by inspecting the whole PlayerClient/PlayerZoneClient/CharacterZoneClient struct
-//     family (eqlib/game/PlayerClient.h): the spell book / memorized-spell / skill arrays
-//     (SpellBook[], MemorizedSpells[], Skill[]) live ONLY on BaseProfile/PcProfile -- i.e. the
-//     LOCAL player character -- never on a remote spawn. This is expected: an NPC's spell/skill
-//     kit is server-authoritative and is only ever revealed to the client at the moment the NPC
-//     actually casts or uses something. There is no client-side data pull that answers "what CAN
-//     this NPC cast"; it can only be INFERRED from observed behavior over time.
-//   - THE CORRECT RE APPROACH for NPC abilities is therefore behavioral inference, which the
-//     action-event log now supports: PollAndLogActions() scans nearby spawns for casting-state
-//     transitions and writes an `npc_cast_start`/`npc_cast_end` row tagging the caster's spawn id
-//     + name + the spell id/name. Correlated against the spawn log and opcode log by timestamp,
-//     this accumulates a real "this NPC was observed casting this spell" history from live play --
-//     the same methodology ShowEQ/EQEmu's own opcode tables were built with, applied to NPC kits.
-
-static FILE* s_spawnLogFile = nullptr;
-static std::mutex s_spawnLogMutex;
-
-static void OpenSpawnLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_spawnLogMutex);
-	if (s_spawnLogFile)
-		return;
-
-	std::string path = std::string(gPathLogs) + "\\PacketLogger_Spawns.csv";
-	s_spawnLogFile = _fsopen(path.c_str(), "a", _SH_DENYWR);
-
-	if (s_spawnLogFile)
-	{
-		fprintf(s_spawnLogFile, "# ---- MQ2PacketLogger session start ----\n");
-		fprintf(s_spawnLogFile,
-			"unix_ms,event,spawn_id,name,type,level,class_id,race_id,"
-			"hp_cur,hp_max,master_id,casting_spell_id,x,y,z\n");
-		fflush(s_spawnLogFile);
-	}
-}
-
-static void CloseSpawnLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_spawnLogMutex);
-	if (s_spawnLogFile)
-	{
-		fprintf(s_spawnLogFile, "# ---- MQ2PacketLogger session end ----\n");
-		fclose(s_spawnLogFile);
-		s_spawnLogFile = nullptr;
+		fprintf(s_logFile, "# ---- MQ2PacketLogger session end ----\n");
+		fclose(s_logFile);
+		s_logFile = nullptr;
 	}
 }
 
@@ -399,47 +293,9 @@ static const char* StandStateName(int s)
 	}
 }
 
-//----------------------------------------------------------------------------
-// Character snapshot log (one-time-per-zone identity dump -- see the CHARACTER-SNAPSHOT note at
-// the top of this file). Written from OnZoned. Not CSV-per-column since the shape is nested
-// (header fields + variable-length inventory/skill/keyring lists); instead a flat
-// `unix_ms,section,key,value` long-format table, which stays consistent with the CSV convention
-// while cleanly handling the ragged nesting without a JSON dependency.
-
-static FILE* s_snapshotLogFile = nullptr;
-static std::mutex s_snapshotLogMutex;
-
-static void OpenSnapshotLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_snapshotLogMutex);
-	if (s_snapshotLogFile)
-		return;
-
-	std::string path = std::string(gPathLogs) + "\\PacketLogger_CharSnapshot.csv";
-	s_snapshotLogFile = _fsopen(path.c_str(), "a", _SH_DENYWR);
-
-	if (s_snapshotLogFile)
-	{
-		fprintf(s_snapshotLogFile, "# ---- MQ2PacketLogger session start ----\n");
-		fprintf(s_snapshotLogFile, "unix_ms,section,key,value\n");
-		fflush(s_snapshotLogFile);
-	}
-}
-
-static void CloseSnapshotLogFile()
-{
-	std::lock_guard<std::mutex> lock(s_snapshotLogMutex);
-	if (s_snapshotLogFile)
-	{
-		fprintf(s_snapshotLogFile, "# ---- MQ2PacketLogger session end ----\n");
-		fclose(s_snapshotLogFile);
-		s_snapshotLogFile = nullptr;
-	}
-}
-
 // Escapes a value for safe embedding in a CSV field (wraps in quotes, doubles any embedded
-// quotes) -- only needed for the one free-text field (target_name), everything else here is
-// numeric/enum and can't contain a comma.
+// quotes) -- needed for any free-text field (names, detail blobs) that could contain a comma or
+// quote; numeric/enum fields don't need it.
 static std::string CsvEscape(const char* value)
 {
 	if (!value || !*value)
@@ -456,6 +312,47 @@ static std::string CsvEscape(const char* value)
 	return out;
 }
 
+static long long NowUnixMs()
+{
+	auto now = std::chrono::system_clock::now();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+// Writes one row into the unified log. a..h are the 8 generic positional columns (pass "" for any
+// this log_type doesn't use); detail is the trailing free-form key=value blob (also "" if unused).
+// See the UNIFIED SINGLE-FILE LOG note at the top of this file for what each log_type packs into
+// a..h vs. detail. Every write is flushed immediately, matching the previous per-log behavior.
+//
+// detail is always wrapped via CsvEscape before being written, regardless of caller, because it's
+// a free-form blob that may embed an already-CsvEscape'd sub-value (e.g. an item/spawn name that
+// itself contains a comma or quote) -- without an outer quote+escape pass, an embedded comma would
+// silently shift every column after it. a..h are simple positional fields (ids, enums, coordinates,
+// or already-escaped names) and are written as-is, matching the original per-file behavior.
+static void LogRow(long long unixMs, const char* logType,
+	const std::string& a, const std::string& b, const std::string& c, const std::string& d,
+	const std::string& e, const std::string& f, const std::string& g, const std::string& h,
+	const std::string& detail)
+{
+	std::lock_guard<std::mutex> lock(s_logMutex);
+	if (!s_logFile)
+		return;
+
+	std::string safeDetail = detail.empty() ? std::string() : CsvEscape(detail.c_str());
+
+	fprintf(s_logFile, "%lld,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+		unixMs, logType,
+		a.c_str(), b.c_str(), c.c_str(), d.c_str(),
+		e.c_str(), f.c_str(), g.c_str(), h.c_str(),
+		safeDetail.c_str());
+	fflush(s_logFile);
+}
+
+// Convenience overload for the action log, which only ever uses column a (event_type) + detail.
+static void LogAction(const char* eventType, const std::string& detail)
+{
+	LogRow(NowUnixMs(), "action", eventType, "", "", "", "", "", "", "", detail);
+}
+
 // Samples current game/character/target state and writes one row. Called only from
 // OnPulse (main thread) -- safe to dereference MQ2's game-state pointers here, unlike from
 // the ntoh/hton detour. Every pointer is null-checked since most of this state legitimately
@@ -464,10 +361,6 @@ static std::string CsvEscape(const char* value)
 // character/target fields blank.
 static void SampleAndLogContext()
 {
-	std::lock_guard<std::mutex> lock(s_contextLogMutex);
-	if (!s_contextLogFile)
-		return;
-
 	auto now = std::chrono::system_clock::now();
 	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
@@ -522,13 +415,25 @@ static void SampleAndLogContext()
 		}
 	}
 
-	fprintf(s_contextLogFile,
-		"%lld,%d,%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%u,%d,%s,%.2f\n",
-		static_cast<long long>(ms), gameState, zoneShort,
-		px, py, pz, pheading, standState, inCombat, castingSpellId,
-		targetId, targetType, targetName.c_str(), targetDistance);
+	// context row: a=game_state b=zone_short c/d/e=x/y/z f=heading; the rest (stand_state,
+	// in_combat, casting_spell_id, target_*) is lower-cardinality/occasional, so it goes in
+	// detail as key=value pairs -- see the UNIFIED SINGLE-FILE LOG note at the top of the file.
+	std::string detail = "stand_state=" + std::to_string(standState)
+		+ " in_combat=" + std::to_string(inCombat)
+		+ " casting_spell_id=" + std::to_string(castingSpellId)
+		+ " target_id=" + std::to_string(targetId)
+		+ " target_type=" + std::to_string(targetType)
+		+ " target_name=" + targetName
+		+ " target_distance=" + std::to_string(targetDistance);
 
-	fflush(s_contextLogFile);
+	char xb[32], yb[32], zb[32], hb[32];
+	sprintf_s(xb, "%.2f", px);
+	sprintf_s(yb, "%.2f", py);
+	sprintf_s(zb, "%.2f", pz);
+	sprintf_s(hb, "%.2f", pheading);
+
+	LogRow(static_cast<long long>(ms), "context",
+		std::to_string(gameState), zoneShort, xb, yb, hb, "", "", "", detail);
 }
 
 // Writes one spawn-event row (called from OnAddSpawn/OnRemoveSpawn). Reads only the readily
@@ -538,32 +443,36 @@ static void LogSpawnEvent(const char* event, PlayerClient* pSpawn)
 	if (!pSpawn)
 		return;
 
-	std::lock_guard<std::mutex> lock(s_spawnLogMutex);
-	if (!s_spawnLogFile)
-		return;
-
 	// HP is int64 on the live eqlib branch and int32 on emu-rof2 -- cast to long long so one
-	// format string works for both builds.
+	// format works for both builds.
 	long long hpCur = static_cast<long long>(pSpawn->HPCurrent);
 	long long hpMax = static_cast<long long>(pSpawn->HPMax);
 
 	std::string name = CsvEscape(pSpawn->Name);
 
-	fprintf(s_spawnLogFile,
-		"%lld,%s,%u,%s,%s,%d,%d,%d,%lld,%lld,%u,%d,%.2f,%.2f,%.2f\n",
-		NowUnixMs(), event, pSpawn->SpawnID, name.c_str(),
-		SpawnTypeName(pSpawn->Type), pSpawn->Level, pSpawn->GetClass(), pSpawn->GetRace(),
-		hpCur, hpMax, pSpawn->MasterID, pSpawn->CastingData.SpellID,
-		pSpawn->X, pSpawn->Y, pSpawn->Z);
-	fflush(s_spawnLogFile);
+	// spawn row: a=event b=spawn_id c=name d=type e=level f/g/h=x/y/z; class/race/hp/master/cast
+	// go in detail -- see the UNIFIED SINGLE-FILE LOG note at the top of the file.
+	std::string detail = "class_id=" + std::to_string(pSpawn->GetClass())
+		+ " race_id=" + std::to_string(pSpawn->GetRace())
+		+ " hp_cur=" + std::to_string(hpCur)
+		+ " hp_max=" + std::to_string(hpMax)
+		+ " master_id=" + std::to_string(pSpawn->MasterID)
+		+ " casting_spell_id=" + std::to_string(pSpawn->CastingData.SpellID);
+
+	char xb[32], yb[32], zb[32];
+	sprintf_s(xb, "%.2f", pSpawn->X);
+	sprintf_s(yb, "%.2f", pSpawn->Y);
+	sprintf_s(zb, "%.2f", pSpawn->Z);
+
+	LogRow(NowUnixMs(), "spawn",
+		event, std::to_string(pSpawn->SpawnID), name, SpawnTypeName(pSpawn->Type),
+		std::to_string(pSpawn->Level), xb, yb, zb, detail);
 }
 
-// One helper row for the snapshot's long-format table.
+// One helper row for the snapshot's long-format table: a=section b=key, detail="value=..".
 static void SnapshotRow(const char* section, const char* key, const std::string& value)
 {
-	if (!s_snapshotLogFile)
-		return;
-	fprintf(s_snapshotLogFile, "%lld,%s,%s,%s\n", NowUnixMs(), section, key, value.c_str());
+	LogRow(NowUnixMs(), "snapshot", section, key, "", "", "", "", "", "", "value=" + value);
 }
 static void SnapshotRow(const char* section, const char* key, int value)
 {
@@ -577,8 +486,11 @@ static void SnapshotRow(const char* section, const char* key, int value)
 // are populated). See the CHARACTER-SNAPSHOT note at the top of the file for what's deferred.
 static void WriteCharSnapshot()
 {
-	std::lock_guard<std::mutex> lock(s_snapshotLogMutex);
-	if (!s_snapshotLogFile)
+	// No lock here -- SnapshotRow()/LogRow() each take s_logMutex internally per row (std::mutex
+	// is non-recursive, so holding it across the whole function would deadlock on the first
+	// SnapshotRow call below). A quick unlocked peek at s_logFile is fine as a cheap early-out;
+	// LogRow() re-checks it under the lock on every row anyway.
+	if (!s_logFile)
 		return;
 
 	PcProfile* pProfile = GetPcProfile();
@@ -684,11 +596,17 @@ static void WriteCharSnapshot()
 	SnapshotRow("keyring", "note", CsvEscape("keyrings not available on this client (pre-keyring-window era, e.g. RoF2)"));
 #endif
 
-	fprintf(s_snapshotLogFile, "# ---- end snapshot ----\n");
-	fflush(s_snapshotLogFile);
+	{
+		std::lock_guard<std::mutex> lock(s_logMutex);
+		if (s_logFile)
+		{
+			fprintf(s_logFile, "# ---- end snapshot ----\n");
+			fflush(s_logFile);
+		}
+	}
 
 	WriteChatf("\ayMQ2PacketLogger\ax: wrote character snapshot (%s, level %d %s) to "
-		"Logs\\PacketLogger_CharSnapshot.csv", pLocalPlayer->Name, pProfile->Level, className);
+		"Logs\\PacketLogger.csv", pLocalPlayer->Name, pProfile->Level, className);
 }
 
 // Edge-detected action poller. Runs from OnPulse at kActionPollInterval. Reads current game state
@@ -857,10 +775,14 @@ static void LogOpcode(const char* direction, int opcode)
 	if (!s_logFile)
 		return;
 
+	// This is the hottest call site in the plugin (every single inbound/outbound packet), so it
+	// writes directly with one fprintf rather than going through LogRow()'s string-building --
+	// same perf characteristics as the original per-file opcode log. opcode row shape:
+	// log_type=opcode a=direction b=opcode_hex c=opcode_dec (d..h/detail left blank).
 	// opcode is logged as both hex and decimal for convenience -- EQEmu's patch_*.conf
 	// files use hex (0xHHHH), but decimal is sometimes easier to eyeball for small/special
 	// values.
-	fprintf(s_logFile, "%lld,%s,0x%04X,%d\n",
+	fprintf(s_logFile, "%lld,opcode,%s,0x%04X,%d,,,,,,\n",
 		static_cast<long long>(ms), direction, static_cast<unsigned int>(opcode) & 0xFFFF, opcode);
 
 	// Flush every write for now -- correctness/durability over throughput while we're still
@@ -1004,10 +926,6 @@ PLUGIN_API void InitializePlugin()
 	DebugSpewAlways("Initializing MQ2PacketLogger");
 
 	OpenLogFile();
-	OpenContextLogFile();
-	OpenActionLogFile();
-	OpenSnapshotLogFile();
-	OpenSpawnLogFile();
 
 	s_packetScramblerDetours = new CPacketScrambler_Detours();
 
@@ -1033,9 +951,8 @@ PLUGIN_API void InitializePlugin()
 		WriteChatf("\arMQ2PacketLogger: CPacketScrambler__hton offset is null, outbound opcode logging disabled.");
 	}
 
-	WriteChatf("\ayMQ2PacketLogger\ax loaded -- opcodes -> Logs\\PacketLogger_Opcodes.csv, "
-		"context -> PacketLogger_Context.csv, actions -> PacketLogger_Actions.csv, "
-		"char snapshot -> PacketLogger_CharSnapshot.csv, spawns -> PacketLogger_Spawns.csv");
+	WriteChatf("\ayMQ2PacketLogger\ax loaded -- opcodes/context/actions/char snapshot/spawns all "
+		"-> Logs\\PacketLogger.csv (unified log, log_type column distinguishes row kinds)");
 
 	// If we loaded while already in-game (plugin reload mid-session), grab a snapshot immediately
 	// rather than waiting for the next zone. OnZoned won't fire until the next zone otherwise.
@@ -1056,10 +973,6 @@ PLUGIN_API void ShutdownPlugin()
 	s_packetScramblerDetours = nullptr;
 
 	CloseLogFile();
-	CloseContextLogFile();
-	CloseActionLogFile();
-	CloseSnapshotLogFile();
-	CloseSpawnLogFile();
 }
 
 //----------------------------------------------------------------------------

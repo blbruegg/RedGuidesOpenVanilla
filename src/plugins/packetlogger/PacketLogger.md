@@ -22,29 +22,34 @@ narrowest possible choke point for observing every opcode the client sends or
 receives — no need to separately understand EQ's packet compression or
 encryption.
 
-In addition to the raw opcode stream, the plugin writes four correlated logs so
-opcodes can actually be tied to what you were doing (added 2026-07-31 after
-play-testing showed the opcode log alone wasn't correlatable):
+In addition to the raw opcode stream, the plugin writes four correlated kinds
+of rows so opcodes can actually be tied to what you were doing (added
+2026-07-31 after play-testing showed the opcode log alone wasn't
+correlatable). **As of 2026-08-01, all five row kinds are written into a
+single unified file, `PacketLogger.csv`**, instead of five separate CSVs —
+see "Output" below for the schema. This replaced the previous 5-file layout
+so everything can be sorted/filtered by timestamp in one place (Excel, a
+script, etc.) without a manual cross-file join.
 
-| Log file | What it captures | Written from |
+| `log_type` value | What it captures | Written from |
 |---|---|---|
-| `PacketLogger_Opcodes.csv` | Every inbound/outbound opcode (the raw firehose). | ntoh/hton detours |
-| `PacketLogger_Context.csv` | Continuous state (zone, position, target, combat, casting) sampled ~4×/sec. | OnPulse (250ms) |
-| `PacketLogger_Actions.csv` | **Discrete, edge-triggered player actions** — cast start/end, sit/stand/duck, combat enter/leave, target change, loot open/close, jump, and observed NPC casts. A row is written the instant a value *changes*, not on a timer. | OnPulse (50ms edge-detect) |
-| `PacketLogger_CharSnapshot.csv` | **One-time character identity dump per zone-in** — name, class, level, race, deity, AA totals, all trained skills, full inventory (every non-empty slot), and keyrings (on clients that have them). | OnZoned |
-| `PacketLogger_Spawns.csv` | **NPC/PC spawn + despawn events** — name, spawn id, type, level, class, race, HP, pet master id, casting spell id, position. | OnAddSpawn/OnRemoveSpawn |
+| `opcode` | Every inbound/outbound opcode (the raw firehose). | ntoh/hton detours |
+| `context` | Continuous state (zone, position, target, combat, casting) sampled ~4×/sec. | OnPulse (250ms) |
+| `action` | **Discrete, edge-triggered player actions** — cast start/end, sit/stand/duck, combat enter/leave, target change, loot open/close, jump, and observed NPC casts. A row is written the instant a value *changes*, not on a timer. | OnPulse (50ms edge-detect) |
+| `snapshot` | **One-time character identity dump per zone-in** — name, class, level, race, deity, AA totals, all trained skills, full inventory (every non-empty slot), and keyrings (on clients that have them). | OnZoned |
+| `spawn` | **NPC/PC spawn + despawn events** — name, spawn id, type, level, class, race, HP, pet master id, casting spell id, position. | OnAddSpawn/OnRemoveSpawn |
 
-All five share the same `unix_ms` epoch, so offline analysis is a
-nearest-timestamp join: find the action/snapshot/spawn row nearest an opcode's
-timestamp to reconstruct what was happening when that opcode fired. The
-`PacketLogger_Actions.csv` log is the one that fixes "I can't tell if I'm
-casting/sitting/jumping from the opcodes" — it gives a precise, semantically
-tagged timestamp for each discrete action to line opcodes up against.
+All five share the same `unix_ms` epoch and now live in one timestamp-ordered
+file, so offline analysis is just filtering/sorting `PacketLogger.csv` by
+`unix_ms` — no manual cross-file join needed. The `action` rows are the ones
+that fix "I can't tell if I'm casting/sitting/jumping from the opcodes" — they
+give a precise, semantically tagged timestamp for each discrete action to line
+opcodes up against.
 
 **On NPC abilities/spells:** the client holds no roster of what an NPC *can*
 cast — spell/skill lists exist only for the local player (`PcProfile`), never
 for remote spawns. An NPC's kit is server-authoritative and only visible at the
-moment it casts. So `PacketLogger_Actions.csv` infers NPC abilities behaviorally:
+moment it casts. So the `action` rows infer NPC abilities behaviorally:
 it edge-detects each spawn's live `CastingData.SpellID` and logs
 `npc_cast_start`/`npc_cast_end` rows tagged with the caster's spawn id. Over
 repeated play this accumulates a real "this NPC was seen casting this spell"
@@ -107,8 +112,9 @@ arbitrary folder).
    ```
    /plugin MQ2PacketLogger load
    ```
-3. You should see a chat message naming all the log files it writes
-   (opcodes, context, actions, char snapshot, spawns) under `Logs\`.
+3. You should see a chat message naming the unified log file
+   (`Logs\PacketLogger.csv`, covering opcodes, context, actions, char
+   snapshot, and spawns) it writes to.
    If instead you see a red warning about `CPacketScrambler__ntoh` or
    `__hton` offset being null, the eqlib offsets don't match this client
    build — stop and re-check the eqlib submodule/client version before
@@ -123,35 +129,67 @@ arbitrary folder).
 
 ## Output
 
-CSV file at `<MacroQuest install>\Logs\PacketLogger_Opcodes.csv`
+Single CSV file at `<MacroQuest install>\Logs\PacketLogger.csv`
 (MacroQuest's standard logs directory — same convention other MQ logging
-plugins use). The file is **opened in append mode**, so it accumulates
-history across sessions/relogs rather than being overwritten — opcode
-coverage builds up over multiple play sessions. Delete it manually if you
-want to start fresh.
+plugins use). All five row kinds (opcode/context/action/spawn/snapshot,
+formerly five separate files) are written into this one file, ordered by
+write time. The file is **opened in append mode**, so it accumulates history
+across sessions/relogs rather than being overwritten. Delete it manually if
+you want to start fresh.
 
-Format:
+Schema: `unix_ms,log_type,a,b,c,d,e,f,g,h,detail`
+
+- `unix_ms` — wall-clock timestamp (ms since Unix epoch) of the write. Shared
+  across all row kinds, so sorting/filtering the whole file by this column
+  interleaves opcodes with actions/context/spawns/snapshot chronologically.
+- `log_type` — one of `opcode`, `context`, `action`, `spawn`, `snapshot`.
+  Determines how the rest of the row is populated.
+- `a`..`h` — 8 generic, positionally-reused columns. Each `log_type` packs its
+  most structured/uniform fields into these left-to-right; unused columns are
+  blank for a given row.
+- `detail` — trailing free-form `key=value key2=value2 ...` blob for
+  whatever didn't fit in `a`..`h` (and the naturally ragged shapes — action
+  detail text, snapshot section/key/value). Always CSV-quoted as a whole
+  field, since it may embed an already-quoted sub-value (an item/spawn name
+  containing a comma, for instance).
+
+Per-`log_type` column packing:
+
+| `log_type` | a | b | c | d | e | f | g | h | detail |
+|---|---|---|---|---|---|---|---|---|---|
+| `opcode` | direction (`in`/`out`) | opcode_hex | opcode_dec | | | | | | *(unused)* |
+| `context` | game_state | zone_short | player_x | player_y | player_z | player_heading | | | `stand_state=.. in_combat=.. casting_spell_id=.. target_id=.. target_type=.. target_name=.. target_distance=..` |
+| `action` | event_type | | | | | | | | free-form detail text (unchanged from the old per-file action log) |
+| `spawn` | event (`spawn`/`despawn`) | spawn_id | name | type | level | x | y | z | `class_id=.. race_id=.. hp_cur=.. hp_max=.. master_id=.. casting_spell_id=..` |
+| `snapshot` | section | key | | | | | | | `value=..` |
+
+Example:
 
 ```
 # ---- MQ2PacketLogger session start ----
-unix_ms,direction,opcode_hex,opcode_dec
-1769649023123,in,0x0042,66
-1769649023456,out,0x00A1,161
+unix_ms,log_type,a,b,c,d,e,f,g,h,detail
+1769649023123,opcode,in,0x0042,66,,,,,,
+1769649023200,action,cast_start,,,,,,,,"spell_id=1234 name=""Minor Heal"" actor=self"
+1769649023456,opcode,out,0x00A1,161,,,,,,
+1769649023500,context,3,soldunga,102.30,-45.10,12.00,180.00,,,"stand_state=0 in_combat=1 casting_spell_id=1234 target_id=501 target_type=0 target_name=""a_skeleton"" target_distance=15.20"
 # ---- MQ2PacketLogger session end ----
 ```
 
-| Column | Meaning |
-|---|---|
-| `unix_ms` | Wall-clock timestamp (ms since Unix epoch) of the log write, i.e. right after the opcode was un/scrambled. |
-| `direction` | `in` (server → client, via `ntoh`) or `out` (client → server, via `hton`). |
-| `opcode_hex` | Opcode as 4-digit hex, masked to 16 bits (`0xHHHH`) — matches the format EQEmu's `patch_*.conf` opcode tables use. |
-| `opcode_dec` | Same opcode as a plain decimal integer, for quick eyeballing of small/special values. |
+Why this schema (not one of the alternatives): a single wide fixed-column
+schema with a named column per field across all five logs was considered and
+rejected — the snapshot log alone has ~5 genuinely different row shapes
+(char header, AA totals, skills, inventory slots, keyring entries) with no
+natural columnar alignment against the other four logs' fields, so most of
+any given row would be blank regardless. Reusing 8 generic positional columns
+plus one trailing `detail` blob keeps the common, already-columnar rows
+(opcode/spawn/context) genuinely readable as real spreadsheet columns while
+still accommodating the ragged shapes (action, snapshot) without losing data.
 
 Every write is flushed immediately (correctness over throughput) — safe to
 tail the file live while playing:
 
 ```
-Get-Content -Path "Logs\PacketLogger_Opcodes.csv" -Wait -Tail 20
+Get-Content -Path "Logs\PacketLogger.csv" -Wait -Tail 20
 ```
 
 ## Troubleshooting
