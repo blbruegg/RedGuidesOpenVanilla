@@ -122,6 +122,7 @@ set(MQ_PLUGIN_SUBDIRS
     "src/plugins/labels"
     "src/plugins/lua"
     "src/plugins/map"
+    "src/plugins/packetlogger"
     "src/plugins/targetinfo"
     "src/plugins/xtarinfo"
 )
