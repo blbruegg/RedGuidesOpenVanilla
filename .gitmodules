@@ -12,3 +12,9 @@
 	path = contrib/luarocks
 	url = https://github.com/macroquest/luarocks.git
 	shallow = true
+[submodule "src/plugins/autoaccept"]
+	path = src/plugins/autoaccept
+	url = https://github.com/blbruegg/MQ2AutoAccept.git
+[submodule "src/plugins/linkdb_current"]
+	path = src/plugins/linkdb_current
+	url = https://github.com/blbruegg/MQ2LinkDB.git
