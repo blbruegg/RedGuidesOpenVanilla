@@ -101,7 +101,10 @@ function(parse_vcpkg_mq_files PORT_DIR MQ_FILES OUT_PACKAGES OUT_DIRS)
 
     foreach(MQ_DIR ${MQ_DIRS})
         file(RELATIVE_PATH PORT "${PORT_DIR}/.." ${MQ_DIR})
-        string(REGEX REPLACE "[\\\\/]" "-" PORT ${PORT})
+        # vcpkg package names must be lowercase alphanumeric+hyphens only, so
+        # sanitize both path separators and underscores (e.g. a directory named
+        # "linkdb_current" would otherwise produce an invalid "linkdb_current" port name).
+        string(REGEX REPLACE "[\\\\/_]" "-" PORT ${PORT})
         string(TOLOWER ${PORT} PORT)
 
         set(ALL_PACKAGES "")

@@ -132,6 +132,7 @@ set(MQ_PLUGIN_SUBDIRS
     "src/plugins/autoaccept"
     "src/plugins/chatevents"
     "src/plugins/gemtimer"
+    "src/plugins/linkdb_current"
 )
 
 set(MQ_TEST_SUBDIRS
