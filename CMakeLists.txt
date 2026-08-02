@@ -124,6 +124,11 @@ set(MQ_PLUGIN_SUBDIRS
     "src/plugins/map"
     "src/plugins/targetinfo"
     "src/plugins/xtarinfo"
+    "src/plugins/pop"
+    "src/plugins/remotecamp"
+    "src/plugins/screenshot"
+    "src/plugins/charnotes"
+    "src/plugins/autoaccepttrades"
 )
 
 set(MQ_TEST_SUBDIRS
