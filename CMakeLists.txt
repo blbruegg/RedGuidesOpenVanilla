@@ -129,7 +129,9 @@ set(MQ_PLUGIN_SUBDIRS
     "src/plugins/remotecamp"
     "src/plugins/screenshot"
     "src/plugins/charnotes"
-    "src/plugins/autoaccepttrades"
+    "src/plugins/autoaccept"
+    "src/plugins/chatevents"
+    "src/plugins/gemtimer"
 )
 
 set(MQ_TEST_SUBDIRS
